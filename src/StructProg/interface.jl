@@ -13,8 +13,8 @@ function createnode(sp::StochasticProgram, m::Model, t, num_stages, solver, pare
     nodes = m.ext[:SDDP].nodes
     if nodes[t] === nothing
         # The last argument contains the categories (e.g. :Cont, :Int, :Bool, ...) but it is currently unused
-        c, T, W, h, C, K, _ = StructJuMP.conicconstraintdata(m)
-        newnodedata = NodeData(NLDS{Float64}(W,h,T,K,C,c,solver,pruningalgo, newcut), parent === nothing ? 0 : SOI.get(sp, SOI.Dimension(), parent))
+        param_model = StructJuMP.ParametrizedModel(m)
+        newnodedata = NodeData(NLDS{Float64}(param_model, solver, pruningalgo, newcut), parent === nothing ? 0 : SOI.get(sp, SOI.Dimension(), parent))
         newnode = SOI.add_scenario_node!(sp, newnodedata)
         SOI.set!(sp, CutGenerator(), newnode, cutgen)
         nodes[t] = newnode

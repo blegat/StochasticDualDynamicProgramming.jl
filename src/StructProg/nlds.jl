@@ -73,12 +73,7 @@ end
 #     σ >= 0
 #     ρ >= 0
 mutable struct NLDS{S}
-    W::AbstractMatrix{S}
-    h::AbstractVector{S}
-    T::AbstractMatrix{S}
-    K
-    C
-    c::AbstractVector{S}
+    model::ParametrizedModel
 
     # parent solution
     x_a::AbstractVector{S}
@@ -118,10 +113,9 @@ mutable struct NLDS{S}
     FCpruner::AbstractCutPruner
     OCpruners::Vector
 
-    function NLDS{S}(W::AbstractMatrix{S}, h::AbstractVector{S}, T::AbstractMatrix{S}, K, C, c::AbstractVector{S}, solver, pruningalgo::AbstractCutPruningAlgo, newcut::Symbol=:AddImmediately) where S
-        nx = size(W, 2)
+    function NLDS{S}(param_model::StructJuMP.ParametrizedModel, solver, pruningalgo::AbstractCutPruningAlgo, newcut::Symbol=:AddImmediately) where S
+        nx = length(param_model.variable_map)
         nθ = 0
-        nπ = length(h)
         localFC = CutStore{S}(nx)
         localOC = CutStore{S}(nx)
         FCpruner = CutPruner{nx, S}(pruningalgo, :≥)
@@ -131,15 +125,11 @@ mutable struct NLDS{S}
         else
             model = MathProgBase.LinearQuadraticModel(solver)
         end
-        nlds = new{S}(W, h, T, K, C, c, S[], nothing, nothing, CutStore{S}[], CutStore{S}[], localFC, localOC, Float64[], BitSet(), Float64[], nothing, AvgCutGenerator(), nx, nθ, nπ, 1:nπ, 0, Int[], Int[], Vector{Int}[], model, false, false, nothing, newcut, pruningalgo, FCpruner, OCpruners)
+        nlds = new{S}(param_model, S[], nothing, nothing, CutStore{S}[], CutStore{S}[], localFC, localOC, Float64[], BitSet(), Float64[], nothing, AvgCutGenerator(), nx, nθ, 1:nπ, 0, Int[], Int[], Vector{Int}[], model, false, false, nothing, newcut, pruningalgo, FCpruner, OCpruners)
         addfollower(localFC, (nlds, (:Feasibility, 0)))
         addfollower(localOC, (nlds, (:Optimality, 1)))
-        nlds
+       nlds
     end
-end
-
-function NLDS{S}(W::AbstractMatrix, h::AbstractVector, T::AbstractMatrix, K, C, c::AbstractVector, solver, pruningalgo::AbstractCutPruningAlgo, newcut::Symbol=:AddImmediately) where S
-    NLDS{S}(AbstractMatrix{S}(W), AbstractVector{S}(h), AbstractMatrix{S}(T), K, C, AbstractVector{S}(c), solver, pruningalgo, newcut)
 end
 
 function add_childT!(nlds, childT)
