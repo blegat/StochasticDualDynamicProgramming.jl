@@ -73,7 +73,7 @@ end
 #     σ >= 0
 #     ρ >= 0
 mutable struct NLDS{S}
-    model::ParametrizedModel
+    param_model::StructJuMP.ParametrizedModel
 
     # parent solution
     x_a::AbstractVector{S}
@@ -92,8 +92,6 @@ mutable struct NLDS{S}
 
     nx::Int
     nθ::Int
-    nπ::Int
-    πs::Vector{Int}
     # Number of feasibility cuts
     nσ::Int
     # Location of each feasibility cut in the constraint matrix
@@ -103,29 +101,22 @@ mutable struct NLDS{S}
     # Location of each optimality cut in the constraint matrix
     ρs::Vector{Vector{Int}}
 
-    model
-    loaded
-    solved
-    prevsol::Union{Nothing, Solution}
+    loaded::Bool
+    solved::Bool
 
     newcut::Symbol
     pruningalgo::AbstractCutPruningAlgo
     FCpruner::AbstractCutPruner
     OCpruners::Vector
 
-    function NLDS{S}(param_model::StructJuMP.ParametrizedModel, solver, pruningalgo::AbstractCutPruningAlgo, newcut::Symbol=:AddImmediately) where S
-        nx = length(param_model.variable_map)
+    function NLDS{S}(model::StructJuMP.ParametrizedModel, pruningalgo::AbstractCutPruningAlgo, newcut::Symbol=:AddImmediately) where S
+        nx = length(model.variable_map)
         nθ = 0
         localFC = CutStore{S}(nx)
         localOC = CutStore{S}(nx)
         FCpruner = CutPruner{nx, S}(pruningalgo, :≥)
         OCpruners = typeof(FCpruner)[]
-        if false
-            model = MathProgBase.ConicModel(solver)
-        else
-            model = MathProgBase.LinearQuadraticModel(solver)
-        end
-        nlds = new{S}(param_model, S[], nothing, nothing, CutStore{S}[], CutStore{S}[], localFC, localOC, Float64[], BitSet(), Float64[], nothing, AvgCutGenerator(), nx, nθ, 1:nπ, 0, Int[], Int[], Vector{Int}[], model, false, false, nothing, newcut, pruningalgo, FCpruner, OCpruners)
+        nlds = new{S}(model, S[], nothing, nothing, CutStore{S}[], CutStore{S}[], localFC, localOC, Float64[], BitSet(), Float64[], nothing, AvgCutGenerator(), nx, nθ, 0, Int[], Int[], Vector{Int}[], false, false, newcut, pruningalgo, FCpruner, OCpruners)
         addfollower(localFC, (nlds, (:Feasibility, 0)))
         addfollower(localOC, (nlds, (:Optimality, 1)))
        nlds
@@ -505,14 +496,6 @@ function load!(nlds::NLDS{S}) where S
     end
 end
 
-function checkstatus(status::Symbol)
-    if status == :Error
-        error("The solver reported an error")
-    elseif status == :UserLimit
-        error("The solver reached iteration limit or timed out")
-    end
-end
-
 function Eθlb(nlds::NLDS)
     if nlds.nθ == 0
         0.
@@ -530,86 +513,7 @@ end
 function solve!(nlds::NLDS{S}) where S
     load!(nlds)
     if !nlds.solved
-        MathProgBase.optimize!(nlds.model)
-        status = MathProgBase.status(nlds.model)
-        checkstatus(status)
-        sol = Solution(status, _getobjval(nlds.model) + Eθlb(nlds))
-
-        if status == :Unbounded
-            uray = _getunboundedray(nlds.model)
-            sol.xuray = uray[1:nlds.nx]
-            sol.objvalxuray = dot(nlds.c, sol.xuray)
-            sol.θuray = uray[nlds.nx .+ (1:nlds.nθ)]
-
-            # See https://github.com/JuliaOpt/Gurobi.jl/issues/80
-            c = MathProgBase.getobj(nlds.model)
-
-            MathProgBase.setobj!(nlds.model, zero(c))
-            MathProgBase.optimize!(nlds.model)
-            newstatus = MathProgBase.status(nlds.model)
-            @assert newstatus != :Unbounded # Now the objective is 0
-            checkstatus(newstatus)
-            if newstatus == :Infeasible
-                # We discard unbounded ray, infeasibility is more important
-                status = newstatus
-                sol.xuray = nothing
-                sol.objvalxuray = nothing
-                sol.θuray = nothing
-            else
-                @assert newstatus == :Optimal
-            end
-            if newstatus == :Infeasible
-                sol.status = :Infeasible
-            end
-        else
-            newstatus = status
-        end
-
-        if newstatus == :Infeasible || status != :Unbounded
-            # if infeasible dual + λ iray is dual feasible for any λ >= 0
-            # here I just take iray to build the feasibility cut
-            dual = _getdual(nlds.model)
-            if isempty(dual)
-                error("Dual vector returned by the solver is empty while the status is $status")
-            end
-            @assert length(dual) == nlds.nπ + nlds.nσ + sum(nlds.nρ)
-
-            π = dual[nlds.πs]
-            σρ = @view dual[nlds.nπ+1:end]
-
-            σ = σρ[nlds.σs]
-            addusage!(nlds.FCpruner, σ)
-            sol.σd = dot(σ, nlds.FCpruner.b)
-
-            sol.ρe = zero(S)
-            for i in 1:nlds.nθ
-                ρ = σρ[nlds.ρs[i]]
-                addusage!(nlds.OCpruners[i], ρ)
-                sol.ρe += dot(ρ, nlds.OCpruners[i].b)
-            end
-
-            sol.πT = vec(π' * nlds.T)
-            sol.πh = dot(π, nlds.h)
-        end
-
-        # Needs to be done after since if status is unbounded I do a resolve
-        if newstatus != :Infeasible
-            primal = _getsolution(nlds.model)
-            sol.x = primal[1:nlds.nx]
-            addposition!(nlds.FCpruner, sol.x)
-            for i in 1:nlds.nθ
-                addposition!(nlds.OCpruners[i], sol.x)
-            end
-            sol.objvalx = dot(nlds.c, sol.x)
-            sol.θ = θC(nlds)[1] .+ primal[nlds.nx .+ (1:nlds.nθ)]
-        end
-
-        if status == :Unbounded
-            # It needs to be done *after* getsolution for some solver (e.g. CPLEX)
-            MathProgBase.setobj!(nlds.model, c)
-        end
-
-        nlds.prevsol = sol
+        StructJuMP.optimize(nlds.model)
     end
 end
 
