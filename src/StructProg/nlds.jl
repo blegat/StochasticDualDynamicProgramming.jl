@@ -6,7 +6,7 @@ mutable struct Solution <: SOI.AbstractSolution
     status::Symbol
     objval
     objvalx
-    objvalxuray
+    objvalxuray # unbouded ray
     x
     xuray # unbouded ray
     θ
@@ -101,22 +101,20 @@ mutable struct NLDS{S}
     # Location of each optimality cut in the constraint matrix
     ρs::Vector{Vector{Int}}
 
-    loaded::Bool
-    solved::Bool
+    prevsol::Union{Nothing, Solution}
 
-    newcut::Symbol
     pruningalgo::AbstractCutPruningAlgo
     FCpruner::AbstractCutPruner
     OCpruners::Vector
 
-    function NLDS{S}(model::StructJuMP.ParametrizedModel, pruningalgo::AbstractCutPruningAlgo, newcut::Symbol=:AddImmediately) where S
+    function NLDS{S}(model::StructJuMP.ParametrizedModel, pruningalgo::AbstractCutPruningAlgo) where S
         nx = length(model.variable_map)
         nθ = 0
         localFC = CutStore{S}(nx)
         localOC = CutStore{S}(nx)
         FCpruner = CutPruner{nx, S}(pruningalgo, :≥)
         OCpruners = typeof(FCpruner)[]
-        nlds = new{S}(model, S[], nothing, nothing, CutStore{S}[], CutStore{S}[], localFC, localOC, Float64[], BitSet(), Float64[], nothing, AvgCutGenerator(), nx, nθ, 0, Int[], Int[], Vector{Int}[], false, false, newcut, pruningalgo, FCpruner, OCpruners)
+        nlds = new{S}(model, S[], nothing, nothing, CutStore{S}[], CutStore{S}[], localFC, localOC, Float64[], BitSet(), Float64[], nothing, AvgCutGenerator(), nx, nθ, 0, Int[], Int[], Vector{Int}[], nothing, pruningalgo, FCpruner, OCpruners)
         addfollower(localFC, (nlds, (:Feasibility, 0)))
         addfollower(localOC, (nlds, (:Optimality, 1)))
        nlds
@@ -168,16 +166,32 @@ function getobjectivebound(nlds::NLDS)
     if !isempty(nlds.θfree)
         return -Inf
     end
-    for (cone, idxs) in nlds.C
-        for i in idxs
-            if (cone == :NonNeg && nlds.c[i]  < 0) ||
-               (cone == :NonPos && nlds.c[i]  > 0) ||
-               (cone == :Free   && nlds.c[i] != 0)
-               return -Inf
-           end
+    obj = JuMP.objective_function(nlds.model.model)
+    if obj isa JuMP.VariableRef
+        obj = convert(JuMP.AffExpr, obj)
+    end
+    if obj != JuMP.AffExpr
+        # TODO quadratic objective
+        @warn "Objective bound for objective of type $(typeof(obj)) not implemented yet."
+        return -Inf
+    end
+    curlb = 0.0
+    for (coef, var) in linear_terms(obj)
+        lb, ub = MOI.Utilities.get_bounds(backend(model), index(var))
+        if coef < 0
+            bound = ub
+        elseif coef > 0
+            bound = lb
+        else
+            continue
+        end
+        if !isfinite(bound)
+            return -Inf
+        else
+            curlb += coef * bound
         end
     end
-    return Eθlb(nlds)
+    return curlb + Eθlb(nlds)
 end
 function setθbound!(nlds::NLDS, i, θlb)
     if isfinite(θlb)
@@ -315,7 +329,6 @@ function notifynewcuts(nlds::NLDS{S}, A::AbstractMatrix{S}, b::AbstractVector{S}
     addstatus = addcuts!(pruner, A, b, mine)
     npushed = sum(addstatus .> ncur)
     @assert ncur + npushed == ncuts(pruner)
-    cur = nlds.nσ + sum(nlds.nρ)
     if isfc
         nlds.nσ += npushed
         is = nlds.σs
@@ -323,36 +336,24 @@ function notifynewcuts(nlds::NLDS{S}, A::AbstractMatrix{S}, b::AbstractVector{S}
         nlds.nρ[i] += npushed
         is = nlds.ρs[i]
     end
-    append!(is, zeros(Int, npushed))
+    append!(is, Vector{JuMP.ConstraintRef}(undef, npushed))
+    x = [nlds.model.variable_map[i] for i in 1:nlds.nx]
+    θ = nlds.model.parameter_map[i]
     for j in 1:nnewcuts
-        if addstatus[j] > ncur
-            cur += 1
-            is[addstatus[j]] = cur
-        end
-        if addstatus[j] > 0 && nlds.loaded
-            if 1 <= addstatus[j] <= ncur || nlds.newcut == :InvalidateSolver
-                # Need to update cut
-                nlds.loaded = false
-                nlds.solved = false
-            elseif nlds.newcut == :AddImmediately
-                idx = collect(1:nlds.nx)
-                a = A[j,:]
-                if !isfc
-                    if i == 0
-                        push!(idx, nlds.nx+1)
-                    else
-                        push!(idx, nlds.nx+i)
-                    end
-                    a = _veccat(a, one(S), true)
-                end
-                _addconstr!(nlds.model, idx, a, b[j], :NonPos)
-                nlds.solved = false
-            else
-                error("Invalid newcut option $(nlds.newcut)")
+        if addstatus[j] > 0
+            if addstatus[j] <= ncur
+                JuMP.delete(is[addstatus[j]])
             end
+            a = A[j, :]
+            β = b[j]
+            is[addstatus[j]] = if isfc
+                @constraint(nlds.model.model, dot(a, x) ≥ β)
+            else
+                @constraint(nlds.model.model, θ ≥ β - dot(a, x))
+            end
+            nlds.prevsol = nothing
         end
     end
-    @assert nlds.newcut == :InvalidateSolver || cur == nlds.nσ + sum(nlds.nρ)
     checkconsistency(nlds)
 end
 
@@ -366,44 +367,12 @@ function checkconsistency(nlds)
     @assert sort([nlds.πs; nlds.nπ .+ nlds.σs; nlds.nπ .+ ρs]) == collect(1:(nlds.nπ + nlds.nσ + sum(nlds.nρ)))
 end
 
-function getrhs(nlds::NLDS{S}) where S
-    checkconsistency(nlds)
-    bs = [nlds.h - nlds.T * nlds.x_a]
-    Ks = [nlds.K]
-    Kcut = []
-    cur = 0
-    b = S[]
-    if !isempty(nlds.FCpruner)
-        append!(b, nlds.FCpruner.b)
-        nlds.nσ = ncuts(nlds.FCpruner)
-        nlds.σs = cur .+ (1:nlds.nσ)
-        cur += ncuts(nlds.FCpruner)
-        push!(Kcut, (:NonPos, nlds.σs))
-    end
-    for i in 1:nlds.nθ
-        if !isempty(nlds.OCpruners[i])
-            append!(b, nlds.OCpruners[i].b)
-            nlds.nρ[i] = ncuts(nlds.OCpruners[i])
-            nlds.ρs[i] = cur .+ (1:nlds.nρ[i])
-            cur += ncuts(nlds.OCpruners[i])
-            push!(Kcut, (:NonPos, nlds.ρs[i]))
-        end
-    end
-    if !isempty(Kcut)
-        push!(bs, b)
-        push!(Ks, Kcut)
-    end
-    checkconsistency(nlds)
-    bs, Ks
-end
-
 function setparentx(nlds::NLDS, x_a::AbstractVector, xuray_a, objvalxuray_a)
     nlds.x_a = x_a
     unbounded_a = xuray_a !== nothing
     if nlds.xuray_a !== nothing || unbounded_a
-        # FIXME do better when delvars!, ... are available in MPB
-        nlds.loaded = false
-        nlds.solved = false
+        error("TODO")
+        nlds.prevsol = nothing
     end
     if unbounded_a
         nlds.xuray_a = xuray_a
@@ -416,10 +385,15 @@ function setparentx(nlds::NLDS, x_a::AbstractVector, xuray_a, objvalxuray_a)
         if unbounded_a
             nlds.loaded = false
         else
+            values = nlds.T * x_a
+            @assert length(nlds.model.parameter_map) == length(values)
+            for (index, parameter) in nlds.model.parameter_map
+                JuMP.fix(parameter, values[index])
+            end
             bs, Ks = getrhs(nlds)
             _setconstrB!(nlds.model, bs, Ks)
         end
-        nlds.solved = false
+        nlds.prevsol = nothing
     end
 end
 
@@ -440,65 +414,9 @@ function computecuts!(nlds::NLDS)
     end
 end
 
-function getcutsDE(nlds::NLDS{S}) where S
-    checkconsistency(nlds)
-    nc = nlds.nσ + sum(nlds.nρ)
-    A = spzeros(S, nc, nlds.nx + nlds.nθ)
-    if !isempty(nlds.FCpruner)
-        A[nlds.σs, 1:nlds.nx] = nlds.FCpruner.A
-    end
-    for i in 1:nlds.nθ
-        if !isempty(nlds.OCpruners[i])
-            A[nlds.ρs[i], 1:nlds.nx] = nlds.OCpruners[i].A
-            A[nlds.ρs[i], nlds.nx .+ i] .= 1
-        end
-    end
-    A
-end
-
-function load!(nlds::NLDS{S}) where S
-    if !nlds.loaded
-        bigA = nlds.W
-        if nlds.nθ > 0
-            bigA = [bigA spzeros(size(bigA, 1), nlds.nθ)]
-        end
-        if nlds.xuray_a !== nothing
-            bigA = [bigA nlds.T * nlds.xuray_a]
-        end
-
-        # Needs to be done before getcutsDE
-        bs, Ks = getrhs(nlds)
-
-        computecuts!(nlds) # FIXME what is the use of this ?
-        A = getcutsDE(nlds)
-        if nlds.xuray_a !== nothing
-            A = [A spzeros(size(A, 1), 1)]
-        end
-        bigA = [bigA; A]
-
-        bigC = nlds.C
-        bigc = nlds.c
-        if nlds.nθ > 0
-            bigC = [bigC; θC(nlds)[2]]
-            if nlds.nθ == 1
-                bigc = [bigc; 1]
-            else
-                bigc = [bigc; nlds.proba]
-            end
-        end
-        if nlds.xuray_a !== nothing
-            bigC = [bigC; (:NonNeg, [nlds.nx+nlds.nθ+1])]
-            bigc = [bigc; nlds.objvalxuray_a]
-        end
-
-        _load!(nlds.model, bigc, bigA, bs, Ks, bigC)
-        nlds.loaded = true
-    end
-end
-
 function Eθlb(nlds::NLDS)
     if nlds.nθ == 0
-        0.
+        0.0
     else
         if nlds.nθ == length(nlds.proba)
             dot(nlds.proba, nlds.θlb)
@@ -511,13 +429,28 @@ function Eθlb(nlds::NLDS)
 end
 
 function solve!(nlds::NLDS{S}) where S
-    load!(nlds)
-    if !nlds.solved
-        StructJuMP.optimize(nlds.model)
+    if nlds.prevsol === nothing
+        JuMP.optimize!(nlds.model.model)
+        if JuMP.primal_status(nlds.model.model) == MOI.INFEASIBILITY_CERTIFICATE
+            # The dual is infeasible but this may not mean that the primal is
+            # unbounded:
+            # See https://github.com/JuliaOpt/Gurobi.jl/issues/80
+            # We set the objective to zero and reoptimize to check
+            obj = JuMP.objective_function(nlds.model.model)
+            set_objective_function(nlds.model.model, zero(AffExpr))
+            JuMP.optimize!(nlds.model.model)
+            set_objective_function(nlds.model.model, obj)
+        solution = StructJuMP.optimize(nlds.model)
+        nlds.prevsol = Solution(
+            solution.feasible ? :Optimal : :Infeasible,
+            solution.objective_value, nothing, nothing,
+            [solution.variable_value[nlds.model.variable_map[i]] for i in 1:nlds.nx],
+            nothing, )
     end
+    return
 end
 
 function getsolution(nlds::NLDS)
     solve!(nlds)
-    nlds.prevsol
+    return nlds.prevsol
 end
